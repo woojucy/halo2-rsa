@@ -12,9 +12,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 maingate = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", version = "0.1.0", rev = "63bde545d934e69c806ef9bc8b18f03f6ec0fe8e" }
 halo2wrong = { git = "https://github.com/privacy-scaling-explorations/halo2wrong", version = "0.1.0", rev = "63bde545d934e69c806ef9bc8b18f03f6ec0fe8e" }
+halo2_proofs = { git = "https://github.com/privacy-scaling-explorations/halo2.git", tag = "v2023_04_20" }
 halo2-dynamic-sha256 = { git = "https://github.com/SoraSuegami/halo2-dynamic-sha256.git", version = "0.1.0", rev = "46dc9c31ca0678bd4d047b54a2944ff2b3594f65"}
 num-bigint = { version = "0.4", features = ["rand"] }
 sha2 = "0.10.6"
+ff = "0.13"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
