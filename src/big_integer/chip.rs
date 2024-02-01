@@ -1377,22 +1377,34 @@ impl<F: FieldExt> BigIntChip<F> {
 #[cfg(test)]
 mod test {
     use std::str::FromStr;
+    use itertools::Itertools;
+    use rand::rngs::OsRng;
+    use snark_verifier::{
+        loader::{
+            self, evm::{self, deploy_and_call, encode_calldata, EvmLoader}, halo2::halo2_wrong_ecc::{self, halo2::{circuit::{Layouter, SimpleFloorPlanner}, halo2curves::{bn256::{Bn256, G1Affine}, grumpkin::Fr}, plonk::{self, keygen_pk, keygen_vk, Circuit, ConstraintSystem, ProvingKey}, poly::kzg::commitment::ParamsKZG, transcript::{EncodedChallenge, TranscriptReadBuffer, TranscriptWriterBuffer}}, integer::rns::Rns, EccConfig}, native::NativeLoader
+        }, pcs::kzg::{Gwc19, KzgAccumulator, KzgAs, KzgSuccinctVerifyingKey, LimbsEncoding}, system::{self, halo2::{compile, transcript::evm::EvmTranscript, Config}}, util::arithmetic::{fe_to_limbs, PrimeField}, verifier::{self, plonk::PlonkProtocol, SnarkVerifier}
+    };
+    use std::{io::Cursor, rc::Rc};
+
+    const LIMBS: usize = 4;
+    const BITS: usize = 68;
+
+    type As = KzgAs<Bn256, Gwc19>;
+    type PlonkSuccinctVerifier = verifier::plonk::PlonkSuccinctVerifier<As, LimbsEncoding<LIMBS, BITS>>;
+    type PlonkVerifier = verifier::plonk::PlonkVerifier<As, LimbsEncoding<LIMBS, BITS>>;
+
 
     use super::*;
-    use halo2wrong::halo2::{
-        circuit::SimpleFloorPlanner,
-        plonk::{Circuit, ConstraintSystem},
-    };
     use maingate::mock_prover_verify;
 
-    struct TestBigMulModCircuit<F: FieldExt> {
+    struct TestBigMulModCircuit<F: PrimeField> {
         a: BigUint,
         b: BigUint,
         n: BigUint,
         _f: PhantomData<F>,
     }
 
-    impl<F: FieldExt> TestBigMulModCircuit<F> {
+    impl<F: PrimeField + halo2wrong::curves::FieldExt> TestBigMulModCircuit<F> {
         const LIMB_WIDTH: usize = 64;
         const BITS_LEN: usize = 4096;
         fn bigint_chip(&self, config: BigIntConfig) -> BigIntChip<F> {
@@ -1400,7 +1412,7 @@ mod test {
         }
     }
 
-    impl<F: FieldExt> Circuit<F> for TestBigMulModCircuit<F> {
+    impl<F: PrimeField> Circuit<F> for TestBigMulModCircuit<F> {
         type Config = BigIntConfig;
         type FloorPlanner = SimpleFloorPlanner;
 
@@ -1426,8 +1438,8 @@ mod test {
         fn synthesize(
             &self,
             config: Self::Config,
-            mut layouter: impl halo2wrong::halo2::circuit::Layouter<F>,
-        ) -> Result<(), Error> {
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), plonk::Error> {
             let bigint_chip = self.bigint_chip(config);
             let num_limbs = Self::BITS_LEN / Self::LIMB_WIDTH;
             layouter.assign_region(
@@ -1459,11 +1471,410 @@ mod test {
         }
     }
 
+
+    const T: usize = 5;
+    const RATE: usize = 4;
+    const R_F: usize = 8;
+    const R_P: usize = 60;
+
+    type Svk = KzgSuccinctVerifyingKey<G1Affine>;
+    type BaseFieldEccChip = halo2_wrong_ecc::BaseFieldEccChip<G1Affine, LIMBS, BITS>;
+    type Halo2Loader<'a> = loader::halo2::Halo2Loader<'a, G1Affine, BaseFieldEccChip>;
+    pub type PoseidonTranscript<L, S> =
+        system::halo2::transcript::halo2::PoseidonTranscript<G1Affine, L, S, T, RATE, R_F, R_P>;
+
+    pub struct Snark {
+        protocol: PlonkProtocol<G1Affine>,
+        instances: Vec<Vec<Fr>>,
+        proof: Vec<u8>,
+    }
+
+    impl Snark {
+        pub fn new(
+            protocol: PlonkProtocol<G1Affine>,
+            instances: Vec<Vec<Fr>>,
+            proof: Vec<u8>,
+        ) -> Self {
+            Self {
+                protocol,
+                instances,
+                proof,
+            }
+        }
+    }
+
+    impl From<Snark> for SnarkWitness {
+        fn from(snark: Snark) -> Self {
+            Self {
+                protocol: snark.protocol,
+                instances: snark
+                    .instances
+                    .into_iter()
+                    .map(|instances| instances.into_iter().map(Value::known).collect_vec())
+                    .collect(),
+                proof: Value::known(snark.proof),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct SnarkWitness {
+        protocol: PlonkProtocol<G1Affine>,
+        instances: Vec<Vec<Value<Fr>>>,
+        proof: Value<Vec<u8>>,
+    }
+
+    impl SnarkWitness {
+        fn without_witnesses(&self) -> Self {
+            SnarkWitness {
+                protocol: self.protocol.clone(),
+                instances: self
+                    .instances
+                    .iter()
+                    .map(|instances| vec![Value::unknown(); instances.len()])
+                    .collect(),
+                proof: Value::unknown(),
+            }
+        }
+
+        fn proof(&self) -> Value<&[u8]> {
+            self.proof.as_ref().map(Vec::as_slice)
+        }
+    }
+
+    pub fn aggregate<'a>(
+        svk: &Svk,
+        loader: &Rc<Halo2Loader<'a>>,
+        snarks: &[SnarkWitness],
+        as_proof: Value<&'_ [u8]>,
+    ) -> KzgAccumulator<G1Affine, Rc<Halo2Loader<'a>>> {
+        let assign_instances = |instances: &[Vec<Value<Fr>>]| {
+            instances
+                .iter()
+                .map(|instances| {
+                    instances
+                        .iter()
+                        .map(|instance| loader.assign_scalar(*instance))
+                        .collect_vec()
+                })
+                .collect_vec()
+        };
+
+        let accumulators = snarks
+            .iter()
+            .flat_map(|snark| {
+                let protocol = snark.protocol.loaded(loader);
+                let instances = assign_instances(&snark.instances);
+                let mut transcript =
+                    PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, snark.proof());
+                let proof =
+                    PlonkSuccinctVerifier::read_proof(svk, &protocol, &instances, &mut transcript)
+                        .unwrap();
+                PlonkSuccinctVerifier::verify(svk, &protocol, &instances, &proof).unwrap()
+            })
+            .collect_vec();
+
+        let acccumulator = {
+            let mut transcript = PoseidonTranscript::<Rc<Halo2Loader>, _>::new(loader, as_proof);
+            let proof =
+                As::read_proof(&Default::default(), &accumulators, &mut transcript).unwrap();
+            As::verify(&Default::default(), &accumulators, &proof).unwrap()
+        };
+
+        acccumulator
+    }
+
+    #[derive(Clone)]
+    pub struct AggregationConfig {
+        main_gate_config: MainGateConfig,
+        range_config: RangeConfig,
+    }
+
+    impl AggregationConfig {
+        pub fn configure<F: PrimeField>(
+            meta: &mut ConstraintSystem<F>,
+            composition_bits: Vec<usize>,
+            overflow_bits: Vec<usize>,
+        ) -> Self {
+            let main_gate_config = MainGate::<F>::configure(meta);
+            let range_config =
+                RangeChip::<F>::configure(meta, &main_gate_config, composition_bits, overflow_bits);
+            AggregationConfig {
+                main_gate_config,
+                range_config,
+            }
+        }
+
+        pub fn main_gate(&self) -> MainGate<Fr> {
+            MainGate::new(self.main_gate_config.clone())
+        }
+
+            RangeChip::new(self.range_config.clone())
+        }
+
+        pub fn ecc_chip(&self) -> BaseFieldEccChip {
+            BaseFieldEccChip::new(EccConfig::new(
+                self.range_config.clone(),
+                self.main_gate_config.clone(),
+            ))
+        }
+
+
+    #[derive(Clone)]
+    pub struct AggregationCircuit {
+        svk: Svk,
+        snarks: Vec<SnarkWitness>,
+        instances: Vec<Fr>,
+        as_proof: Value<Vec<u8>>,
+    }
+
+    impl AggregationCircuit {
+        pub fn new(params: &ParamsKZG<Bn256>, snarks: impl IntoIterator<Item = Snark>) -> Self {
+            let svk = params.get_g()[0].into();
+            let snarks = snarks.into_iter().collect_vec();
+
+            let accumulators = snarks
+                .iter()
+                .flat_map(|snark| {
+                    let mut transcript =
+                        PoseidonTranscript::<NativeLoader, _>::new(snark.proof.as_slice());
+                    let proof = PlonkSuccinctVerifier::read_proof(
+                        &svk,
+                        &snark.protocol,
+                        &snark.instances,
+                        &mut transcript,
+                    )
+                    .unwrap();
+                    PlonkSuccinctVerifier::verify(&svk, &snark.protocol, &snark.instances, &proof)
+                        .unwrap()
+                })
+                .collect_vec();
+
+            let (accumulator, as_proof) = {
+                let mut transcript = PoseidonTranscript::<NativeLoader, _>::new(Vec::new());
+                let accumulator =
+                    As::create_proof(&Default::default(), &accumulators, &mut transcript, OsRng)
+                        .unwrap();
+                (accumulator, transcript.finalize())
+            };
+
+            let KzgAccumulator { lhs, rhs } = accumulator;
+            let instances = [lhs.x, lhs.y, rhs.x, rhs.y]
+                .map(fe_to_limbs::<_, _, LIMBS, BITS>)
+                .concat();
+
+            Self {
+                svk,
+                snarks: snarks.into_iter().map_into().collect(),
+                instances,
+                as_proof: Value::known(as_proof),
+            }
+        }
+
+        pub fn accumulator_indices() -> Vec<(usize, usize)> {
+            (0..4 * LIMBS).map(|idx| (0, idx)).collect()
+        }
+
+        pub fn num_instance() -> Vec<usize> {
+            vec![4 * LIMBS]
+        }
+
+        pub fn instances(&self) -> Vec<Vec<Fr>> {
+            vec![self.instances.clone()]
+        }
+
+        pub fn as_proof(&self) -> Value<&[u8]> {
+            self.as_proof.as_ref().map(Vec::as_slice)
+        }
+    }
+
+    impl Circuit<Fr> for AggregationCircuit {
+        type Config = AggregationConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "halo2_circuit_params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            Self {
+                svk: self.svk,
+                snarks: self
+                    .snarks
+                    .iter()
+                    .map(SnarkWitness::without_witnesses)
+                    .collect(),
+                instances: Vec::new(),
+                as_proof: Value::unknown(),
+            }
+        }
+
+        fn configure(meta: &mut plonk::ConstraintSystem<Fr>) -> Self::Config {
+            AggregationConfig::configure(
+                meta,
+                vec![BITS / LIMBS],
+                Rns::<Fq, Fr, LIMBS, BITS>::construct().overflow_lengths(),
+            )
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<Fr>,
+        ) -> Result<(), plonk::Error> {
+            let main_gate = config.main_gate();
+            let range_chip = config.range_chip();
+
+            range_chip.load_table(&mut layouter)?;
+
+            let accumulator_limbs = layouter.assign_region(
+                || "",
+                |region| {
+                    let ctx = RegionCtx::new(region, 0);
+
+                    let ecc_chip = config.ecc_chip();
+                    let loader = Halo2Loader::new(ecc_chip, ctx);
+                    let accumulator = aggregate(&self.svk, &loader, &self.snarks, self.as_proof());
+
+                    let accumulator_limbs = [accumulator.lhs, accumulator.rhs]
+                        .iter()
+                        .map(|ec_point| {
+                            loader.ecc_chip().assign_ec_point_to_limbs(
+                                &mut loader.ctx_mut(),
+                                ec_point.assigned(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, Error>>()?
+                        .into_iter()
+                        .flatten();
+
+                    Ok(accumulator_limbs)
+                },
+            )?;
+
+            for (row, limb) in accumulator_limbs.enumerate() {
+                main_gate.expose_public(layouter.namespace(|| ""), limb, row)?;
+            }
+
+            Ok(())
+        }
+    }
+
+fn gen_srs(k: u32) -> ParamsKZG<Bn256> {
+    ParamsKZG::<Bn256>::setup(k, OsRng)
+}
+
+fn gen_pk<C: Circuit<Fr>>(params: &ParamsKZG<Bn256>, circuit: &C) -> ProvingKey<G1Affine> {
+    let vk = keygen_vk(params, circuit).unwrap();
+    keygen_pk(params, vk, circuit).unwrap()
+}
+
+fn gen_proof<
+    C: Circuit<Fr>,
+    E: EncodedChallenge<G1Affine>,
+    TR: TranscriptReadBuffer<Cursor<Vec<u8>>, G1Affine, E>,
+    TW: TranscriptWriterBuffer<Vec<u8>, G1Affine, E>,
+>(
+    params: &ParamsKZG<Bn256>,
+    pk: &ProvingKey<G1Affine>,
+    circuit: C,
+    instances: Vec<Vec<Fr>>,
+) -> Vec<u8> {
+    MockProver::run(params.k(), &circuit, instances.clone())
+        .unwrap()
+        .assert_satisfied();
+
+    let instances = instances
+        .iter()
+        .map(|instances| instances.as_slice())
+        .collect_vec();
+    let proof = {
+        let mut transcript = TW::init(Vec::new());
+        create_proof::<KZGCommitmentScheme<Bn256>, ProverGWC<_>, _, _, TW, _>(
+            params,
+            pk,
+            &[circuit],
+            &[instances.as_slice()],
+            OsRng,
+            &mut transcript,
+        )
+        .unwrap();
+        transcript.finalize()
+    };
+
+    let accept = {
+        let mut transcript = TR::init(Cursor::new(proof.clone()));
+        VerificationStrategy::<_, VerifierGWC<_>>::finalize(
+            verify_proof::<_, VerifierGWC<_>, _, TR, _>(
+                params.verifier_params(),
+                pk.get_vk(),
+                AccumulatorStrategy::new(params.verifier_params()),
+                &[instances.as_slice()],
+                &mut transcript,
+            )
+            .unwrap(),
+        )
+    };
+    assert!(accept);
+
+    proof
+}
+
+fn gen_application_snark(params: &ParamsKZG<Bn256>) -> aggregation::Snark {
+    let circuit = application::StandardPlonk::rand(OsRng);
+
+    let pk = gen_pk(params, &circuit);
+    let protocol = compile(
+        params,
+        pk.get_vk(),
+        Config::kzg().with_num_instance(application::StandardPlonk::num_instance()),
+    );
+
+    let proof = gen_proof::<
+        _,
+        _,
+        aggregation::PoseidonTranscript<NativeLoader, _>,
+        aggregation::PoseidonTranscript<NativeLoader, _>,
+    >(params, &pk, circuit.clone(), circuit.instances());
+    aggregation::Snark::new(protocol, circuit.instances(), proof)
+}
+
+fn gen_aggregation_evm_verifier(
+    params: &ParamsKZG<Bn256>,
+    vk: &VerifyingKey<G1Affine>,
+    num_instance: Vec<usize>,
+    accumulator_indices: Vec<(usize, usize)>,
+) -> Vec<u8> {
+    let protocol = compile(
+        params,
+        vk,
+        Config::kzg()
+            .with_num_instance(num_instance.clone())
+            .with_accumulator_indices(Some(accumulator_indices)),
+    );
+    let vk = (params.get_g()[0], params.g2(), params.s_g2()).into();
+
+    let loader = EvmLoader::new::<Fq, Fr>();
+    let protocol = protocol.loaded(&loader);
+    let mut transcript = EvmTranscript::<_, Rc<EvmLoader>, _, _>::new(&loader);
+
+    let instances = transcript.load_instances(num_instance);
+    let proof = PlonkVerifier::read_proof(&vk, &protocol, &instances, &mut transcript).unwrap();
+    PlonkVerifier::verify(&vk, &protocol, &instances, &proof).unwrap();
+
+    evm::compile_solidity(&loader.solidity_code())
+}
+
+fn evm_verify(deployment_code: Vec<u8>, instances: Vec<Vec<Fr>>, proof: Vec<u8>) {
+    let calldata = encode_calldata(&instances, &proof);
+    let gas_cost = deploy_and_call(deployment_code, calldata).unwrap();
+    dbg!(gas_cost);
+}
+
+
     #[test]
-    fn test_bigmulmod() {
+    fn test_big_mul_mod() {
         use num_bigint::RandomBits;
         use rand::{thread_rng, Rng};
-        fn run<F: FieldExt>() {
+        fn run<F: PrimeField>() {
             let mut rng = thread_rng();
             let bits_len = TestBigMulModCircuit::<F>::BITS_LEN as u64;
             let mut n = BigUint::default();

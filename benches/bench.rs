@@ -1,7 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use halo2_rsa::{
-    big_integer::{BigIntChip, BigIntConfig, BigIntInstructions, UnassignedInteger},
-};
+use halo2_rsa::big_integer::{BigIntChip, BigIntConfig, BigIntInstructions, UnassignedInteger};
 use halo2wrong::{
     curves::FieldExt,
     halo2::{
